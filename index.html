@@ -17648,81 +17648,184 @@ Web versiyada istifadə et və ya Google Play Internal Testing-ə yüklə.`, fal
                 haptic(10);
             };
             
-            // İframe scripts-in yüklənməsini gözləyən köməkçi funksiya
-            async function waitForIframeReady(maxWaitMs = 15000) {
-                const start = Date.now();
-                while (Date.now() - start < maxWaitMs) {
-                    try {
-                        if (iframe.contentWindow && 
-                            typeof iframe.contentWindow.sharePDF === 'function' &&
-                            typeof iframe.contentWindow.html2canvas === 'function' &&
-                            iframe.contentWindow.jspdf) {
-                            return true;
-                        }
-                    } catch(e) {}
-                    await new Promise(r => setTimeout(r, 250));
-                }
-                return false;
+            // 🎯 PDF kitabxanalarını MAIN APP-də yüklə (iframe-dən asılı olmasın)
+            function loadScriptOnce(src) {
+                return new Promise((resolve, reject) => {
+                    // Artıq yüklənibsə skip
+                    const existing = document.querySelector(`script[src="${src}"]`);
+                    if (existing) {
+                        if (existing.dataset.loaded === 'true') return resolve();
+                        existing.addEventListener('load', () => resolve());
+                        existing.addEventListener('error', () => reject(new Error('Load fail: ' + src)));
+                        return;
+                    }
+                    const s = document.createElement('script');
+                    s.src = src;
+                    s.onload = () => { s.dataset.loaded = 'true'; resolve(); };
+                    s.onerror = () => reject(new Error('Load fail: ' + src));
+                    document.head.appendChild(s);
+                });
             }
             
-            // 🖨️ Çap et / Saxla düyməsi
+            async function ensurePdfLibsInMainApp() {
+                try {
+                    if (!window.html2canvas) {
+                        await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js');
+                    }
+                    if (!window.jspdf) {
+                        await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+                    }
+                    return !!(window.html2canvas && window.jspdf);
+                } catch(e) {
+                    console.error('PDF libs load error:', e);
+                    return false;
+                }
+            }
+            
+            // Modal açılan kimi kitabxanaları paralel yüklə
+            const libsPromise = ensurePdfLibsInMainApp();
+            
+            // PDF yarat - iframe-in body-sini çək
+            async function generatePdfFromIframe() {
+                const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                if (!iframeDoc) throw new Error('İframe sənədi mövcud deyil');
+                
+                // iframe body-sini şəkilə çevir
+                const canvas = await window.html2canvas(iframeDoc.body, {
+                    scale: 2,
+                    useCORS: true,
+                    backgroundColor: '#ffffff',
+                    logging: false,
+                    windowWidth: iframeDoc.documentElement.scrollWidth,
+                    windowHeight: iframeDoc.documentElement.scrollHeight
+                });
+                
+                // PDF yarat
+                const { jsPDF } = window.jspdf;
+                const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
+                const pageWidth = pdf.internal.pageSize.getWidth();
+                const pageHeight = pdf.internal.pageSize.getHeight();
+                const imgWidth = pageWidth - 20;
+                const imgHeight = (canvas.height * imgWidth) / canvas.width;
+                
+                let heightLeft = imgHeight;
+                let position = 10;
+                const imgData = canvas.toDataURL('image/jpeg', 0.92);
+                
+                pdf.addImage(imgData, 'JPEG', 10, position, imgWidth, imgHeight);
+                heightLeft -= (pageHeight - 20);
+                
+                while (heightLeft > 0) {
+                    position = heightLeft - imgHeight + 10;
+                    pdf.addPage();
+                    pdf.addImage(imgData, 'JPEG', 10, position, imgWidth, imgHeight);
+                    heightLeft -= (pageHeight - 20);
+                }
+                
+                return pdf;
+            }
+            
+            // PDF Share / Save - hər iki düymə üçün ortaq
+            async function doSharePdf(btn, originalText) {
+                btn.disabled = true;
+                btn.innerHTML = '⏳ ' + (tt('pdf_preparing') || 'Hazırlanır...');
+                
+                try {
+                    // Kitabxanalar hazırdır?
+                    const ok = await libsPromise;
+                    if (!ok) {
+                        alert('❌ PDF kitabxanaları yüklənmədi.\n\nİnterneti yoxla və yenidən cəhd et.');
+                        return;
+                    }
+                    
+                    // PDF yarat
+                    const pdf = await generatePdfFromIframe();
+                    const fileName = 'tfinance_' + Date.now() + '.pdf';
+                    const pdfBlob = pdf.output('blob');
+                    const file = new File([pdfBlob], fileName, { type: 'application/pdf' });
+                    
+                    // Native paylaşma sınayır
+                    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                        try {
+                            await navigator.share({
+                                title: 'T$ Finance PDF',
+                                files: [file]
+                            });
+                            btn.innerHTML = '✅ ' + (tt('pdf_saved') || 'Paylaşıldı!');
+                            setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 1500);
+                            return;
+                        } catch(shareErr) {
+                            if (shareErr.name === 'AbortError') {
+                                // İstifadəçi ləğv etdi
+                                btn.innerHTML = originalText;
+                                btn.disabled = false;
+                                return;
+                            }
+                        }
+                    }
+                    
+                    // Native Capacitor Filesystem-də yaz (Android APK üçün)
+                    if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+                        try {
+                            const Filesystem = window.Capacitor.Plugins.Filesystem;
+                            const base64String = await new Promise((resolve) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                reader.readAsDataURL(pdfBlob);
+                            });
+                            await Filesystem.writeFile({
+                                path: 'Download/' + fileName,
+                                data: base64String,
+                                directory: 'EXTERNAL_STORAGE',
+                                recursive: true
+                            });
+                            btn.innerHTML = '✅ Yadda saxlandı!';
+                            setTimeout(() => {
+                                alert('📥 PDF SAXLANDI!\n\n📁 Yer: Download qovluğu\n📄 ' + fileName);
+                                btn.innerHTML = originalText;
+                                btn.disabled = false;
+                            }, 500);
+                            return;
+                        } catch(fsErr) {
+                            console.error('Filesystem write error:', fsErr);
+                        }
+                    }
+                    
+                    // Web fallback - blob URL ilə yüklə
+                    const url = URL.createObjectURL(pdfBlob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = fileName;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(url), 100);
+                    
+                    btn.innerHTML = '✅ ' + (tt('pdf_saved') || 'Yükləndi!');
+                    setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 1500);
+                    
+                } catch (err) {
+                    console.error('PDF error:', err);
+                    alert('❌ ' + (err.message || 'PDF yaranma xətası'));
+                    btn.innerHTML = originalText;
+                    btn.disabled = false;
+                }
+            }
+            
+            // 🖨️ Çap et düyməsi
             const printBtn = document.getElementById('pdfPrintBtn');
             const printBtnOriginal = printBtn.innerHTML;
-            printBtn.onclick = async () => {
+            printBtn.onclick = () => {
                 haptic(10);
-                printBtn.disabled = true;
-                printBtn.innerHTML = '⏳ ' + (tt('pdf_preparing') || 'Hazırlanır...');
-                
-                // iframe scripts hazırdır?
-                const ready = await waitForIframeReady();
-                if (!ready) {
-                    printBtn.disabled = false;
-                    printBtn.innerHTML = printBtnOriginal;
-                    alert('❌ PDF kitabxanaları yüklənmədi.\n\nİnterneti yoxla və yenidən cəhd et.');
-                    return;
-                }
-                
-                // sharePDF çağır - eyni şey saxlayır + share sheet açır
-                // Share sheet-də "Save to Files" / "Print" seçimi olur
-                try {
-                    await iframe.contentWindow.sharePDF();
-                    printBtn.disabled = false;
-                    printBtn.innerHTML = printBtnOriginal;
-                } catch (err) {
-                    console.error('Print error:', err);
-                    printBtn.disabled = false;
-                    printBtn.innerHTML = printBtnOriginal;
-                    alert('❌ Xəta: ' + (err.message || err));
-                }
+                doSharePdf(printBtn, printBtnOriginal);
             };
             
             // 📤 Paylaş düyməsi
             const shareBtn = document.getElementById('pdfShareBtn');
             const shareBtnOriginal = shareBtn.innerHTML;
-            shareBtn.onclick = async () => {
+            shareBtn.onclick = () => {
                 haptic(10);
-                shareBtn.disabled = true;
-                shareBtn.innerHTML = '⏳ ' + (tt('pdf_preparing') || 'Hazırlanır...');
-                
-                // iframe scripts hazırdır?
-                const ready = await waitForIframeReady();
-                if (!ready) {
-                    shareBtn.disabled = false;
-                    shareBtn.innerHTML = shareBtnOriginal;
-                    alert('❌ PDF kitabxanaları yüklənmədi.\n\nİnterneti yoxla və yenidən cəhd et.');
-                    return;
-                }
-                
-                try {
-                    await iframe.contentWindow.sharePDF();
-                    shareBtn.disabled = false;
-                    shareBtn.innerHTML = shareBtnOriginal;
-                } catch (err) {
-                    console.error('Share error:', err);
-                    shareBtn.disabled = false;
-                    shareBtn.innerHTML = shareBtnOriginal;
-                    alert('❌ Xəta: ' + (err.message || err));
-                }
+                doSharePdf(shareBtn, shareBtnOriginal);
             };
             
             // Android geri düyməsi və ESC modal bağlasın
@@ -18475,8 +18578,33 @@ Web versiyada istifadə et və ya Google Play Internal Testing-ə yüklə.`, fal
     });
     window.addEventListener('beforeunload', stopBackgroundTasks);
 
+    // 🌙 AVTOMATİK GECƏ REJİMİ - 20:00 dark, 08:00 light
+    function applyAutoTheme() {
+        const autoEnabled = localStorage.getItem('themeAutoMode') !== 'false';  // default ON
+        if (!autoEnabled) return;
+        
+        const hour = new Date().getHours();
+        const shouldBeDark = hour >= 20 || hour < 8;
+        const isDark = document.body.classList.contains('dark');
+        
+        if (shouldBeDark && !isDark) {
+            document.body.classList.add('dark');
+            localStorage.setItem('theme', 'dark');
+            console.log('🌙 Avtomatik gecə rejimi aktiv (saat ' + hour + ':00)');
+        } else if (!shouldBeDark && isDark) {
+            document.body.classList.remove('dark');
+            localStorage.setItem('theme', 'light');
+            console.log('☀️ Avtomatik gündüz rejimi aktiv (saat ' + hour + ':00)');
+        }
+    }
+    
+    // Hər dəqiqədə yoxla
+    setInterval(applyAutoTheme, 60000);
+    
     async function init() {
+        // Tema: əvvəlcə saxlanmış dəyər, sonra avtomatik yoxlama
         if(localStorage.getItem('theme') === 'dark') document.body.classList.add('dark');
+        applyAutoTheme();  // 🌙 dərhal yoxla - saat 20:00+ idisə dark mode olsun
         // Köhnə (səhv) saxlanmış kursları sil — yeni versiyaya keçirik
         const RATES_VERSION = 'v3_2026_05_17'; // Yeniləndi - real-time kurslar üçün
         if(localStorage.getItem('exchangeRatesVersion') !== RATES_VERSION) {
